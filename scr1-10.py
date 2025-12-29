@@ -70,16 +70,16 @@ class UltimateAllPredictor:
         self.slot_win_streak = {"FRBD": 0, "GZBD": 0, "DSWR": 0, "GALI": 0}
         self.slot_loss_streak = {"FRBD": 0, "GZBD": 0, "DSWR": 0, "GALI": 0}
         
-        # OPTIMIZED STRATEGIES
+        # OPTIMIZED STRATEGIES (UPDATED K VALUES)
         self.slot_strategies = {
-            'FRBD': {'focus_range': range(0, 34), 'optimal_k': 18, 'boost_hot': True, 
-                    'stake_multiplier': 1.2, 'max_k': 25, 'min_k': 12, 'unit_stake': 10},
-            'GZBD': {'focus_range': range(34, 67), 'optimal_k': 15, 'boost_patterns': True,
+            'FRBD': {'focus_range': range(0, 34), 'optimal_k': 20, 'boost_hot': True,  # ✅ 18→20
+                    'stake_multiplier': 1.2, 'max_k': 25, 'min_k': 15, 'unit_stake': 10},  # ✅ 12→15
+            'GZBD': {'focus_range': range(34, 67), 'optimal_k': 12, 'boost_patterns': True,  # ✅ 15→12
                     'stake_multiplier': 0.5, 'max_k': 20, 'min_k': 5, 'protection_mode': True, 'unit_stake': 5},
             'GALI': {'focus_range': range(0, 100), 'optimal_k': 20, 'boost_hot': False,
                     'stake_multiplier': 0.9, 'max_k': 30, 'min_k': 15, 'unit_stake': 10},
-            'DSWR': {'focus_range': range(67, 100), 'optimal_k': 18, 'boost_s40': True,
-                    'stake_multiplier': 1.3, 'max_k': 25, 'min_k': 12, 'unit_stake': 10}
+            'DSWR': {'focus_range': range(67, 100), 'optimal_k': 20, 'boost_s40': True,  # ✅ 18→20
+                    'stake_multiplier': 1.3, 'max_k': 25, 'min_k': 15, 'unit_stake': 10}  # ✅ 12→15
         }
         
         self.optimal_top_k = {'FRBD': 18, 'GZBD': 15, 'GALI': 20, 'DSWR': 18}
@@ -88,7 +88,7 @@ class UltimateAllPredictor:
         self.emergency_mode = False
         self.total_profit = 0
         self.total_days = 0
-        self.min_weight = 0.10
+        self.min_weight = 0.15  # ✅ Increased from 0.10 to 0.15
         self.max_weight = 0.80
         
         # DATA LEAKAGE PREVENTION
@@ -1561,10 +1561,25 @@ class UltimateAllPredictor:
                     pred_df = pd.read_excel(pred_file, sheet_name='Predictions_Detailed_All')
                 except:
                     pred_df = pd.read_excel(pred_file, sheet_name='Predictions_Detailed')
-                if 'source' not in pred_df.columns: continue
+
+                print(f"🔒 WEIGHT LEARNING: Processing {date_str}")
+                
+                # Check if we have actual results for this date
                 date_obj = pd.to_datetime(date_str)
                 actual_for_date = actual_df[actual_df['date'].dt.date == date_obj.date()]
-                if actual_for_date.empty: continue
+                
+                if actual_for_date.empty:
+                    print(f"   - ❌ No actual results, skipping weight update")
+                    continue
+                else:
+                    actual_values = {}
+                    for slot in ['FRBD', 'GZBD', 'GALI', 'DSWR']:
+                        if slot in actual_for_date.columns:
+                            val = actual_for_date[slot].iloc[0]
+                            actual_values[slot] = 'XX' if pd.isna(val) or str(val).upper() == 'XX' else val
+                    print(f"   - ✓ Actual results: {actual_values}")
+
+                if 'source' not in pred_df.columns: continue
                 
                 for slot_id, slot_name in self.slot_names.items():
                     actual_columns = [col for col in ['FRBD', 'GZBD', 'GALI', 'DSWR'] if col in actual_for_date.columns]
@@ -1617,16 +1632,29 @@ class UltimateAllPredictor:
                                             attempts = self.model_weights[model_id].get('total_attempts', 0)
                                             hits = self.model_weights[model_id].get('total_hits', 0)
                                             
+                                            # ✅ SOFTER PENALTIES
                                             if attempts < 5:
-                                                penalty = 0.98
+                                                penalty = 0.98  # Same
+                                            elif attempts >= 15 and hits == 0:
+                                                penalty = 0.85  # Was 0.7
                                             elif attempts >= 10 and hits == 0:
-                                                penalty = 0.7
+                                                penalty = 0.90  # Was 0.85
                                             elif attempts >= 5 and hits == 0:
-                                                penalty = 0.85
+                                                penalty = 0.95  # Was 0.85
                                             else:
-                                                penalty = 0.95
+                                                penalty = 0.97  # Was 0.95
                                             
                                             new_weight = old_weight * penalty
+                                        
+                                        # ✅ WEIGHT RECOVERY: If weight too low but recent performance OK
+                                        recent_history = self.model_weights[model_id].get('performance_history', [])[-5:]
+                                        if len(recent_history) >= 3:
+                                            recent_hits = sum(1 for perf in recent_history if perf.get('hit', False))
+                                            if recent_hits >= 2 and new_weight < 0.25:
+                                                # If hitting recently but weight too low, boost it
+                                                recovery_boost = 1.10
+                                                new_weight = old_weight * recovery_boost
+                                                print(f"   - 🔄 Weight recovery: {old_weight:.3f} → {new_weight:.3f}")
                                         
                                         old_before_clamp = new_weight
                                         if new_weight < self.min_weight:
@@ -1880,7 +1908,17 @@ class UltimateAllPredictor:
                 
                 best_k = 25
                 best_profit = -float('inf')
+
+                # ✅ K FLOOR FOR WINNING SLOTS
                 classification = slot_stats[slot_name]['classification']
+                roi = slot_stats[slot_name]['roi']
+                
+                if slot_name != 'GZBD' and classification in ['hero', 'superhero'] and roi > 15:
+                    # Winning slot gets minimum K floor
+                    min_k_floor = 18 if slot_name in ['FRBD', 'DSWR'] else 15
+                    best_k = max(best_k, min_k_floor)
+                    print(f"   - 🎯 K floor applied: min {min_k_floor} for {slot_name} ({classification}, ROI:{roi:.1f}%)")
+                
                 win_streak = self.slot_win_streak.get(slot_name, 0)
                 loss_streak = self.slot_loss_streak.get(slot_name, 0)
                 

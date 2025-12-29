@@ -256,11 +256,29 @@ class PNLCalculator:
             
             # Skip if already processed
             if date_str in processed_dates:
+                print(f"🔒 SKIP: Date {date_str} already in P&L (immutable)")
                 continue
                 
             if date_str not in actual_results['date'].dt.date.astype(str).values: 
                 print(f"ℹ️ No actual result for {date_str}")
                 continue
+
+            # 🔒 P&L MAPPING LOCK
+            print(f"🔒 P&L CHECK: Processing {date_str}")
+            print(f"   - Prediction file: {pred_file.name}")
+            
+            # Find actual result for this date
+            actual_row = actual_results[actual_results['date'].dt.date.astype(str) == date_str]
+            if not actual_row.empty:
+                actual_values = {}
+                for slot in ['FRBD', 'GZBD', 'GALI', 'DSWR']:
+                    if slot in actual_row.columns:
+                        val = actual_row[slot].iloc[0]
+                        actual_values[slot] = val if not pd.isna(val) else 'XX'
+                print(f"   - Actual results: {actual_values}")
+            else:
+                print(f"   - ❌ NO ACTUAL RESULTS FOUND")
+
             predictions_df = self.load_predictions_file(pred_file)
             if predictions_df is None: continue
             
