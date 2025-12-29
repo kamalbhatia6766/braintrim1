@@ -82,6 +82,9 @@ class UltimateAllPredictor:
                     'stake_multiplier': 1.3, 'max_k': 25, 'min_k': 15, 'unit_stake': 10}  # ✅ 12→15
         }
         
+        # Experiment toggle for GZBD strategies
+        self.gzbd_experiment_mode = "default"  # "default", "k_reduced", "s40_only"
+        
         self.optimal_top_k = {'FRBD': 18, 'GZBD': 15, 'GALI': 20, 'DSWR': 18}
         self.dynamic_stakes = {'FRBD': 10, 'GZBD': 10, 'GALI': 10, 'DSWR': 10}
         self.conservative_mode = False
@@ -1562,7 +1565,8 @@ class UltimateAllPredictor:
                 except:
                     pred_df = pd.read_excel(pred_file, sheet_name='Predictions_Detailed')
 
-                print(f"🔒 WEIGHT LEARNING: Processing {date_str}")
+                if not QUIET_MODE:
+                    print(f"🔒 Learning {date_str}")
                 
                 # Check if we have actual results for this date
                 date_obj = pd.to_datetime(date_str)
@@ -1571,13 +1575,6 @@ class UltimateAllPredictor:
                 if actual_for_date.empty:
                     print(f"   - ❌ No actual results, skipping weight update")
                     continue
-                else:
-                    actual_values = {}
-                    for slot in ['FRBD', 'GZBD', 'GALI', 'DSWR']:
-                        if slot in actual_for_date.columns:
-                            val = actual_for_date[slot].iloc[0]
-                            actual_values[slot] = 'XX' if pd.isna(val) or str(val).upper() == 'XX' else val
-                    print(f"   - ✓ Actual results: {actual_values}")
 
                 if 'source' not in pred_df.columns: continue
                 
@@ -1591,6 +1588,7 @@ class UltimateAllPredictor:
                             if slot_preds.empty: slot_preds = pred_df[pred_df['slot'] == slot_id]
                             if slot_preds.empty: continue
                             
+                            script_outcomes = []
                             for script_name in scripts:
                                 script_preds = slot_preds[slot_preds['source'] == script_name]
                                 if not script_preds.empty:
@@ -1599,85 +1597,106 @@ class UltimateAllPredictor:
                                         try: predicted_numbers.append(int(num))
                                         except: continue
                                     score = self.calculate_script_score(script_name, slot_name, predicted_numbers, actual_result)
-                                    model_id = f"{script_name}_{slot_name}"
-                                    if model_id in self.model_weights:
-                                        perf_entry = {'date': date_str, 'hit': score > 0, 'score': score}
-                                        if 'performance_history' not in self.model_weights[model_id]:
-                                            self.model_weights[model_id]['performance_history'] = []
-                                        self.model_weights[model_id]['performance_history'].append(perf_entry)
-                                        if len(self.model_weights[model_id]['performance_history']) > 30:
-                                            self.model_weights[model_id]['performance_history'] = self.model_weights[model_id]['performance_history'][-30:]
-                                        old_weight = self.model_weights[model_id]['weight']
+                                    hit_rank = 0
+                                    if score > 0:
+                                        _, hit_rank = self.calculate_script_score_with_rank(script_name, slot_name, predicted_numbers, actual_result)
+                                    script_outcomes.append({
+                                        'script': script_name,
+                                        'model_id': f"{script_name}_{slot_name}",
+                                        'score': score,
+                                        'hit_rank': hit_rank
+                                    })
+                            
+                            if not script_outcomes:
+                                continue
+                            
+                            hit_candidates = [r for r in script_outcomes if r['score'] > 0]
+                            winning_result = None
+                            if hit_candidates:
+                                winning_result = max(hit_candidates, key=lambda r: (r['score'], -(r['hit_rank'] or 0)))
+
+                            for outcome in script_outcomes:
+                                model_id = outcome['model_id']
+                                if model_id in self.model_weights:
+                                    is_hit = winning_result is not None and outcome['script'] == winning_result['script']
+                                    perf_entry = {'date': date_str, 'hit': is_hit, 'score': outcome['score'] if is_hit else 0.0}
+                                    if 'performance_history' not in self.model_weights[model_id]:
+                                        self.model_weights[model_id]['performance_history'] = []
+                                    self.model_weights[model_id]['performance_history'].append(perf_entry)
+                                    if len(self.model_weights[model_id]['performance_history']) > 30:
+                                        self.model_weights[model_id]['performance_history'] = self.model_weights[model_id]['performance_history'][-30:]
+                                    old_weight = self.model_weights[model_id]['weight']
+                                    
+                                    clamp_status = ""
+                                    
+                                    if is_hit:
+                                        hit_rank = winning_result['hit_rank'] or 15
+                                        attempts = self.model_weights[model_id].get('total_attempts', 0)
+                                        scale_factor = min(1.0, attempts / 10)
                                         
-                                        clamp_status = ""
-                                        
-                                        if score > 0:
-                                            _score, hit_rank = self.calculate_script_score_with_rank(script_name, slot_name, predicted_numbers, actual_result)
-                                            attempts = self.model_weights[model_id].get('total_attempts', 0)
-                                            scale_factor = min(1.0, attempts / 10)
-                                            
-                                            if hit_rank == 1:
-                                                rank_boost = 1.15 * scale_factor
-                                            elif hit_rank <= 3:
-                                                rank_boost = 1.10 * scale_factor
-                                            elif hit_rank <= 5:
-                                                rank_boost = 1.05 * scale_factor
-                                            elif hit_rank <= 10:
-                                                rank_boost = 1.02 * scale_factor
-                                            else:
-                                                rank_boost = 1.01 * scale_factor
-                                            
-                                            new_weight = old_weight * rank_boost
+                                        if hit_rank == 1:
+                                            rank_boost = 1.15 * scale_factor
+                                        elif hit_rank <= 3:
+                                            rank_boost = 1.10 * scale_factor
+                                        elif hit_rank <= 5:
+                                            rank_boost = 1.05 * scale_factor
+                                        elif hit_rank <= 10:
+                                            rank_boost = 1.02 * scale_factor
                                         else:
-                                            attempts = self.model_weights[model_id].get('total_attempts', 0)
-                                            hits = self.model_weights[model_id].get('total_hits', 0)
-                                            
-                                            # ✅ SOFTER PENALTIES
-                                            if attempts < 5:
-                                                penalty = 0.98  # Same
-                                            elif attempts >= 15 and hits == 0:
-                                                penalty = 0.85  # Was 0.7
-                                            elif attempts >= 10 and hits == 0:
-                                                penalty = 0.90  # Was 0.85
-                                            elif attempts >= 5 and hits == 0:
-                                                penalty = 0.95  # Was 0.85
-                                            else:
-                                                penalty = 0.97  # Was 0.95
-                                            
-                                            new_weight = old_weight * penalty
+                                            rank_boost = 1.01 * scale_factor
                                         
-                                        # ✅ WEIGHT RECOVERY: If weight too low but recent performance OK
-                                        recent_history = self.model_weights[model_id].get('performance_history', [])[-5:]
-                                        if len(recent_history) >= 3:
-                                            recent_hits = sum(1 for perf in recent_history if perf.get('hit', False))
-                                            if recent_hits >= 2 and new_weight < 0.25:
-                                                # If hitting recently but weight too low, boost it
-                                                recovery_boost = 1.10
-                                                new_weight = old_weight * recovery_boost
-                                                print(f"   - 🔄 Weight recovery: {old_weight:.3f} → {new_weight:.3f}")
+                                        new_weight = old_weight * rank_boost
+                                    else:
+                                        attempts = self.model_weights[model_id].get('total_attempts', 0)
+                                        hits = self.model_weights[model_id].get('total_hits', 0)
                                         
-                                        old_before_clamp = new_weight
-                                        if new_weight < self.min_weight:
-                                            new_weight = self.min_weight
-                                            clamp_status = "CLAMP_MIN"
-                                        elif new_weight > self.max_weight:
-                                            new_weight = self.max_weight
-                                            clamp_status = "CLAMP_MAX"
+                                        # ✅ SOFTER PENALTIES
+                                        if attempts < 5:
+                                            penalty = 0.98  # Same
+                                        elif attempts >= 15 and hits == 0:
+                                            penalty = 0.85  # Was 0.7
+                                        elif attempts >= 10 and hits == 0:
+                                            penalty = 0.90  # Was 0.85
+                                        elif attempts >= 5 and hits == 0:
+                                            penalty = 0.95  # Was 0.85
+                                        else:
+                                            penalty = 0.97  # Was 0.95
                                         
-                                        self.model_weights[model_id]['clamp_status'] = clamp_status
-                                        self.model_weights[model_id]['pre_clamp_weight'] = old_before_clamp
-                                        
-                                        if 'weight_history' not in self.model_weights[model_id]:
-                                            self.model_weights[model_id]['weight_history'] = [old_weight]
-                                        self.model_weights[model_id]['weight_history'].append(new_weight)
-                                        self.model_weights[model_id]['weight'] = new_weight
-                                        self.model_weights[model_id]['total_attempts'] = self.model_weights[model_id].get('total_attempts', 0) + 1
-                                        if score > 0:
-                                            self.model_weights[model_id]['total_hits'] = self.model_weights[model_id].get('total_hits', 0) + 1
-                                        self.model_weights[model_id]['overall_accuracy'] = (
-                                            self.model_weights[model_id].get('total_hits', 0) / 
-                                            max(1, self.model_weights[model_id].get('total_attempts', 0))
-                                        )
+                                        new_weight = old_weight * penalty
+                                    
+                                    # ✅ WEIGHT RECOVERY: If weight too low but recent performance OK
+                                    recent_history = self.model_weights[model_id].get('performance_history', [])[-5:]
+                                    if len(recent_history) >= 3:
+                                        recent_hits = sum(1 for perf in recent_history if perf.get('hit', False))
+                                        if recent_hits >= 2 and new_weight < 0.25:
+                                            # If hitting recently but weight too low, boost it
+                                            recovery_boost = 1.10
+                                            new_weight = old_weight * recovery_boost
+                                            if not QUIET_MODE and new_weight > old_weight * 1.15:
+                                                print(f" 🔄 Boost: {old_weight:.3f}→{new_weight:.3f}")
+                                    
+                                    old_before_clamp = new_weight
+                                    if new_weight < self.min_weight:
+                                        new_weight = self.min_weight
+                                        clamp_status = "CLAMP_MIN"
+                                    elif new_weight > self.max_weight:
+                                        new_weight = self.max_weight
+                                        clamp_status = "CLAMP_MAX"
+                                    
+                                    self.model_weights[model_id]['clamp_status'] = clamp_status
+                                    self.model_weights[model_id]['pre_clamp_weight'] = old_before_clamp
+                                    
+                                    if 'weight_history' not in self.model_weights[model_id]:
+                                        self.model_weights[model_id]['weight_history'] = [old_weight]
+                                    self.model_weights[model_id]['weight_history'].append(new_weight)
+                                    self.model_weights[model_id]['weight'] = new_weight
+                                    self.model_weights[model_id]['total_attempts'] = self.model_weights[model_id].get('total_attempts', 0) + 1
+                                    if is_hit:
+                                        self.model_weights[model_id]['total_hits'] = self.model_weights[model_id].get('total_hits', 0) + 1
+                                    self.model_weights[model_id]['overall_accuracy'] = (
+                                        self.model_weights[model_id].get('total_hits', 0) / 
+                                        max(1, self.model_weights[model_id].get('total_attempts', 0))
+                                    )
             except Exception as e:
                 continue
         
@@ -1897,13 +1916,18 @@ class UltimateAllPredictor:
                     continue
                 
                 if slot_name == 'GZBD':
-                    gzbd_strategy = self.get_gzbd_protection_strategy(
-                        slot_stats[slot_name]['roi'],
-                        slot_stats[slot_name]['classification'],
-                        self.slot_win_streak.get(slot_name, 0),
-                        self.slot_loss_streak.get(slot_name, 0)
-                    )
-                    optimal_k[slot_name] = gzbd_strategy['numbers_k']
+                    if self.gzbd_experiment_mode == "k_reduced":
+                        optimal_k[slot_name] = 8  # Reduced from 10-12
+                    elif self.gzbd_experiment_mode == "s40_only":
+                        optimal_k[slot_name] = 10  # Keep same K, filter later
+                    else:
+                        gzbd_strategy = self.get_gzbd_protection_strategy(
+                            slot_stats[slot_name]['roi'],
+                            slot_stats[slot_name]['classification'],
+                            self.slot_win_streak.get(slot_name, 0),
+                            self.slot_loss_streak.get(slot_name, 0)
+                        )
+                        optimal_k[slot_name] = gzbd_strategy['numbers_k']
                     continue
                 
                 best_k = 25
@@ -2325,7 +2349,7 @@ class UltimateAllPredictor:
             total_scripts = len(slot_tracker)
             total_weight = sum(d.get('weight', 0.0) for d in slot_tracker)
 
-            quiet_print(f"\n{slot_name} (Top 3 of {total_scripts}):")
+            quiet_print(f"\n{slot_name}:")
 
             slot_tracker_top = slot_tracker[:3]
             for script_data in slot_tracker_top:
@@ -2423,7 +2447,7 @@ class UltimateAllPredictor:
             
             quiet_print(f"{slot_name} ({classification})[{streak_display}] K:{optimal_k} ROI:{roi:+.1f}% Stk:₹{stake}({unit_stake}₹)")
             quiet_print(f"  Nums:{numbers_str}")
-            quiet_print(f"  A:{sorted(andar_digits)} B:{sorted(bahar_digits)}")
+            quiet_print(f"  A={'/'.join(map(str,sorted(andar_digits)))} B={'/'.join(map(str,sorted(bahar_digits)))}")
             
             if slot_name in top_scripts and top_scripts[slot_name]:
                 top_script = top_scripts[slot_name][0]
@@ -2437,20 +2461,7 @@ class UltimateAllPredictor:
             calculator = PNLCalculator()
             calculator.optimal_top_k = self.optimal_top_k
         
-            # ✅ DEBUG: Show what we're processing
-            if not QUIET_MODE:
-                import os
-                pred_dir = calculator.PREDICTIONS_DIR
-                if pred_dir.exists():
-                    pred_files = list(pred_dir.glob("ultimate_predictions_*.xlsx"))
-                    print(f"ℹ️ Found {len(pred_files)} prediction files")
-        
-            per_slot_data, day_total_data, cumulative_data, latest_day_breakdown = calculator.run(debug=False)
-        
-            # ✅ Check if PNL file was created/updated
-            if calculator.PNL_FILE.exists():
-                file_size = calculator.PNL_FILE.stat().st_size
-                print(f"ℹ️ PNL file size: {file_size} bytes")
+        per_slot_data, day_total_data, cumulative_data, latest_day_breakdown = calculator.run(debug=False)
         
             if latest_day_breakdown:
                 self.print_pnl_verification(latest_day_breakdown)

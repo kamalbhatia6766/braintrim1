@@ -4,6 +4,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import warnings
 from collections import defaultdict
+import sys
+
+QUIET_MODE = '--quiet' in sys.argv
 
 warnings.filterwarnings('ignore')
 
@@ -256,7 +259,6 @@ class PNLCalculator:
             
             # Skip if already processed
             if date_str in processed_dates:
-                print(f"🔒 SKIP: Date {date_str} already in P&L (immutable)")
                 continue
                 
             if date_str not in actual_results['date'].dt.date.astype(str).values: 
@@ -264,8 +266,9 @@ class PNLCalculator:
                 continue
 
             # 🔒 P&L MAPPING LOCK
-            print(f"🔒 P&L CHECK: Processing {date_str}")
-            print(f"   - Prediction file: {pred_file.name}")
+            if not QUIET_MODE:
+                print(f"🔒 P&L: {date_str}")
+                print(f"   - Prediction file: {pred_file.name}")
             
             # Find actual result for this date
             actual_row = actual_results[actual_results['date'].dt.date.astype(str) == date_str]
